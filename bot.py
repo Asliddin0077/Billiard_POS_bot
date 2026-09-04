@@ -367,7 +367,7 @@ async def admin_reject(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("revoke:"))
 async def admin_revoke(callback: CallbackQuery):
     user_id = callback.data.split(":")[1]
-    supabase.table("users").update({"subscribed": False}).eq("id", user_id).execute()
+    supabase.table("users").update({"subscribed": False, "subscription_until": None}).eq("id", user_id).execute()
     last_payment = supabase.table("payments").select("id").eq("user_id", user_id).order("created_at", desc=True).limit(1).execute()
     if last_payment.data:
         supabase.table("payments").delete().eq("id", last_payment.data[0]["id"]).execute()
