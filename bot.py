@@ -49,7 +49,7 @@ TZ = timezone(timedelta(hours=5))
 DAY_START_HOUR = 8          # klub kuni 08:00 dan 08:00 gacha
 REPORT_HOUR = 9             # kunlik hisobot soat 09:00 da
 REMINDER_HOUR = 10          # obuna eslatmasi soat 10:00 da
-MILESTONES = [25, 50, 100, 150, 200]
+MILESTONES = [50, 100, 150, 200]
 
 
 @dp.error()
@@ -556,7 +556,10 @@ def activate_subscription(user_id: str, days: int, tier: str, amount: int, label
     supabase.table("users").update(
         {"subscribed": True, "subscription_until": new_until.isoformat(), "pending_plan": None, "plan_tier": tier}
     ).eq("id", user_id).execute()
-    supabase.table("payments").insert({"user_id": user_id, "amount": amount, "plan_label": label}).execute()
+    try:
+        supabase.table("payments").insert({"user_id": user_id, "amount": amount, "plan_label": label, "tier": tier}).execute()
+    except Exception:  # patch 28 hali ishga tushirilmagan bo'lsa
+        supabase.table("payments").insert({"user_id": user_id, "amount": amount, "plan_label": label}).execute()
     return new_until
 
 
@@ -726,65 +729,105 @@ async def list_plans(message: Message):
 
 
 # ---------------- Admin: umumiy hisobot ----------------
-@dp.message(Command("hisobot"))
-async def report(message: Message):
-    if message.chat.id != ADMIN_CHAT_ID:
-        return
+def payment_tier(p: dict) -> str:
+    t = p.get("tier")
+    if t in ("basic", "pro"):
+        return t
+    return "basic" if "Oddiy" in str(p.get("plan_label") or "") else "pro"
 
+
+def build_admin_report(yesterday: bool = False) -> str:
     now = datetime.now(timezone.utc)
-    today_start = now.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-    month_start = now.astimezone(TZ).replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    local = now.astimezone(TZ)
+    day_start_l = local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1 if yesterday else 0)
+    day_end_l = day_start_l + timedelta(days=1)
+    day_start, day_end = day_start_l.astimezone(timezone.utc), day_end_l.astimezone(timezone.utc)
+    month_start = day_start_l.replace(day=1).astimezone(timezone.utc)
+    day_word = "Kecha" if yesterday else "Bugun"
 
-    pay_today = supabase.table("payments").select("amount").gte("created_at", today_start.isoformat()).execute()
-    pay_month = supabase.table("payments").select("amount").gte("created_at", month_start.isoformat()).execute()
-    pay_all = supabase.table("payments").select("amount").execute()
-    revenue_today = sum(p["amount"] or 0 for p in (pay_today.data or []))
-    revenue_month = sum(p["amount"] or 0 for p in (pay_month.data or []))
-    revenue_all = sum(p["amount"] or 0 for p in (pay_all.data or []))
+    pays = supabase.table("payments").select("*").execute().data or []
+    def rev(ps): return sum(p.get("amount") or 0 for p in ps)
+    p_day = [p for p in pays if day_start <= (parse_dt(p.get("created_at")) or now) < day_end]
+    p_month = [p for p in pays if (parse_dt(p.get("created_at")) or now) >= month_start]
+    paid_users = {p["user_id"] for p in pays}
 
-    users = supabase.table("users").select("id, name, subscribed, account_type, created_at, plan_tier").execute().data or []
-    total_users = len(users)
-    new_today = len([u for u in users if (parse_dt(u["created_at"]) or now) >= today_start])
-    active_subs = len([u for u in users if u.get("subscribed") or u.get("account_type") == "vip"])
-    vip_count = len([u for u in users if u.get("account_type") == "vip"])
-    basic_count = len([u for u in users if u.get("plan_tier") == "basic"])
-    inactive = total_users - active_subs
+    users = supabase.table("users").select("*").execute().data or []
+    owners = [u for u in users if (u.get("role") or "owner") == "owner"]
+    new_day = [u for u in owners if day_start <= (parse_dt(u.get("created_at")) or now) < day_end]
+    vip = [u for u in owners if u.get("account_type") == "vip"]
+    active = [u for u in owners if owner_is_active(u) and u.get("account_type") != "vip"]
+    act_basic = [u for u in active if tier_of(u) == "basic"]
+    act_pro = [u for u in active if tier_of(u) == "pro"]
+    inactive = len(owners) - len(active) - len(vip)
 
-    ht = supabase.table("session_history").select("owner_id, total").gte("end_time", today_start.isoformat()).execute().data or []
-    active_owners_today = len(set(r["owner_id"] for r in ht))
-    tables_closed_today = len(ht)
-    avg_check_today = (sum(r["total"] or 0 for r in ht) / len(ht)) if ht else 0
-
+    ht = supabase.table("session_history").select("owner_id, total").gte("end_time", day_start.isoformat()).lt("end_time", day_end.isoformat()).execute().data or []
+    avg_check = (sum(r["total"] or 0 for r in ht) / len(ht)) if ht else 0
     hm = supabase.table("session_history").select("owner_id").gte("end_time", month_start.isoformat()).execute().data or []
     counts = {}
     for r in hm:
         counts[r["owner_id"]] = counts.get(r["owner_id"], 0) + 1
-    top_owner_name, top_count = None, 0
-    if counts:
-        top_owner_id = max(counts, key=counts.get)
-        top_count = counts[top_owner_id]
-        u = supabase.table("users").select("name").eq("id", top_owner_id).limit(1).execute()
-        if u.data:
-            top_owner_name = u.data[0]["name"]
+    names = {u["id"]: u["name"] for u in users}
 
     text = (
-        f"📊 <b>Hisobot</b> — {now.astimezone(TZ).strftime('%d.%m.%Y')}\n\n"
-        f"👥 <b>Foydalanuvchilar</b>\n"
-        f"Jami: {total_users} · Bugun qo'shilgan: {new_today}\n"
-        f"Faol obuna: {active_subs} (VIP: {vip_count}) · Obunasiz: {inactive}\n"
-        f"Tarif: 🟢 Oddiy {basic_count} · ⭐ Pro {total_users - basic_count}\n\n"
+        f"📊 <b>Admin hisoboti</b> — {day_start_l.strftime('%d.%m.%Y')}\n\n"
+        f"👥 <b>Mijozlar (klub egalari)</b>\n"
+        f"Jami: {len(owners)} · {day_word} qo'shilgan: {len(new_day)}\n"
+        f"Faol obuna: {len(active)}  →  🟢 Oddiy: {len(act_basic)} · ⭐ Pro: {len(act_pro)}\n"
+        f"👑 VIP: {len(vip)} · ❌ Obunasiz: {inactive}\n\n"
         f"💰 <b>Daromad</b>\n"
-        f"Bugun: {fmt_money(revenue_today)}\n"
-        f"Shu oy: {fmt_money(revenue_month)}\n"
-        f"Jami (umr bo'yi): {fmt_money(revenue_all)}\n\n"
-        f"🎯 <b>Faollik (bugun)</b>\n"
-        f"Faol klublar: {active_owners_today}\n"
-        f"Yopilgan stollar: {tables_closed_today}\n"
-        f"O'rtacha chek: {fmt_money(avg_check_today)}\n"
+        f"{day_word}: {fmt_money(rev(p_day))}  (🟢 {fmt_money(rev([p for p in p_day if payment_tier(p) == 'basic']))} · ⭐ {fmt_money(rev([p for p in p_day if payment_tier(p) == 'pro']))})\n"
+        f"Shu oy: {fmt_money(rev(p_month))}  (🟢 {fmt_money(rev([p for p in p_month if payment_tier(p) == 'basic']))} · ⭐ {fmt_money(rev([p for p in p_month if payment_tier(p) == 'pro']))})\n"
+        f"Jami: {fmt_money(rev(pays))}\n\n"
+        f"🎯 <b>Faollik ({day_word.lower()})</b>\n"
+        f"Faol klublar: {len(set(r['owner_id'] for r in ht))} · Yopilgan stollar: {len(ht)}\n"
+        f"O'rtacha chek: {fmt_money(avg_check)}\n"
     )
-    if top_owner_name:
-        text += f"\n🏆 <b>Oyning eng faol mijozi:</b> {html.escape(top_owner_name)} ({top_count} marta stol yopgan)"
-    await message.answer(text, parse_mode="HTML")
+    if counts:
+        top = max(counts, key=counts.get)
+        text += f"🏆 Oyning eng faol mijozi: {html.escape(names.get(top, '?'))} ({counts[top]} ta stol)\n"
+
+    # obunasi 3 kun ichida tugaydiganlar
+    soon = []
+    for u in active:
+        until = parse_dt(u.get("subscription_until"))
+        if until and 0 < (until - now).total_seconds() <= 3 * 86400:
+            soon.append((until, u))
+    text += f"\n⏰ <b>Obunasi 3 kun ichida tugaydi ({len(soon)})</b>\n"
+    if soon:
+        for until, u in sorted(soon, key=lambda x: x[0])[:20]:
+            text += (f"• {html.escape(u['name'])} (<code>{html.escape(u['login'])}</code>) · {fmt_date(until)} · "
+                     f"{TIER_ICON[tier_of(u)]} · {html.escape(str(u.get('phone') or '—'))}\n")
+    else:
+        text += "— hech kim\n"
+
+    # tekin sinovdagilar (hali to'lov qilmagan)
+    trial = [u for u in active if u.get("trial_used") and u["id"] not in paid_users]
+    text += f"\n🎁 <b>Tekin sinovda, hali to'lamagan ({len(trial)})</b>\n"
+    if trial:
+        for u in sorted(trial, key=lambda x: x.get("subscription_until") or "")[:20]:
+            until = parse_dt(u.get("subscription_until"))
+            text += (f"• {html.escape(u['name'])} (<code>{html.escape(u['login'])}</code>) · "
+                     f"{fmt_date(until) if until else '—'} gacha · {html.escape(str(u.get('phone') or '—'))}\n")
+    else:
+        text += "— hech kim\n"
+    return text
+
+
+async def send_long(chat_id: int, text: str):
+    while text:
+        if len(text) <= 3900:
+            await bot.send_message(chat_id, text, parse_mode="HTML")
+            return
+        cut_at = text.rfind("\n", 0, 3900)
+        await bot.send_message(chat_id, text[:cut_at], parse_mode="HTML")
+        text = text[cut_at + 1:]
+
+
+@dp.message(Command("hisobot"))
+async def report(message: Message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    await send_long(message.chat.id, build_admin_report(False))
 
 
 # ---------------- Boshqa har qanday xabar -> support ----------------
@@ -839,18 +882,96 @@ def pro_report_owners() -> list[dict]:
 def sessions_between(owner_ids: list[str], a: datetime, b: datetime) -> list[dict]:
     if not owner_ids:
         return []
-    res = supabase.table("session_history").select("owner_id, table_name, hall_name, duration_seconds, table_cost, extras_cost, total, payment_method, end_time") \
+    res = supabase.table("session_history").select(
+        "owner_id, table_name, hall_name, start_time, end_time, duration_seconds, table_cost, extras_cost, total, payment_method, extras, actor_name") \
         .in_("owner_id", owner_ids).gte("end_time", a.astimezone(timezone.utc).isoformat()).lt("end_time", b.astimezone(timezone.utc).isoformat()).execute()
     return res.data or []
 
 
-def build_daily_report(u: dict, rows: list[dict], prev_count: int, day_start: datetime) -> str:
+WEEKDAYS = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
+
+
+def fmt_dur(sec) -> str:
+    m = int((sec or 0) // 60)
+    return f"{m // 60} soat {m % 60} daqiqa" if m >= 60 else f"{m} daqiqa"
+
+
+def biz_day_of(r: dict) -> str:
+    """Seans qaysi klub kuniga tegishli (08:00 dan 08:00 gacha)."""
+    d = (parse_dt(r.get("end_time")) or datetime.now(timezone.utc)).astimezone(TZ) - timedelta(hours=DAY_START_HOUR)
+    return d.strftime("%Y-%m-%d")
+
+
+def peak_hour(rows: list[dict]) -> str | None:
+    hours = {}
+    for r in rows:
+        st = parse_dt(r.get("start_time"))
+        if st:
+            h = st.astimezone(TZ).hour
+            hours[h] = hours.get(h, 0) + 1
+    if not hours:
+        return None
+    h = max(hours, key=hours.get)
+    return f"{h:02d}:00–{(h + 1) % 24:02d}:00"
+
+
+def top_bar_item(rows: list[dict]) -> tuple[str, int] | None:
+    items = {}
+    for r in rows:
+        for e in (r.get("extras") or []):
+            name = (e or {}).get("name") if isinstance(e, dict) else None
+            if name:
+                q = int(e.get("qty") or 1) if isinstance(e.get("qty"), (int, float)) else 1
+                items[name] = items.get(name, 0) + q
+    if not items:
+        return None
+    n = max(items, key=items.get)
+    return n, items[n]
+
+
+def top_staff(rows: list[dict]) -> tuple[str, int] | None:
+    who = {}
+    for r in rows:
+        a = (r.get("actor_name") or "").strip()
+        if a:
+            who[a] = who.get(a, 0) + 1
+    if len(who) < 2:     # faqat bitta odam yopgan bo'lsa - ko'rsatishga arzimaydi
+        return None
+    n = max(who, key=who.get)
+    return n, who[n]
+
+
+def owner_warnings(owner_id: str) -> list[str]:
+    out = []
+    try:
+        wh = supabase.table("warehouse_items").select("name, units_in_stock, low_stock_threshold").eq("owner_id", owner_id).execute().data or []
+        low = [w for w in wh if (w.get("units_in_stock") or 0) <= (w.get("low_stock_threshold") if w.get("low_stock_threshold") is not None else 5)]
+        if low:
+            parts = ", ".join(f"{html.escape(str(w['name']))} — {int(w.get('units_in_stock') or 0)} dona" for w in low[:5])
+            more = f" va yana {len(low) - 5} ta" if len(low) > 5 else ""
+            out.append(f"📦 Skladda kam qoldi: {parts}{more}")
+    except Exception as e:
+        log.warning("Sklad o'qilmadi: %s", e)
+    try:
+        ds = supabase.table("debts").select("amount, paid_amount, status").eq("owner_id", owner_id).execute().data or []
+        open_d = [d for d in ds if d.get("status") != "closed" and (d.get("amount") or 0) - (d.get("paid_amount") or 0) > 0]
+        if open_d:
+            left = sum((d.get("amount") or 0) - (d.get("paid_amount") or 0) for d in open_d)
+            out.append(f"📒 Qarzdorlar: {len(open_d)} kishi, jami {fmt_money(left)}")
+    except Exception as e:
+        log.warning("Qarzlar o'qilmadi: %s", e)
+    return out
+
+
+def build_daily_report(u: dict, rows: list[dict], prev_count: int, day_start: datetime,
+                       month_rows: list[dict] | None = None, warnings: list[str] | None = None) -> str:
     n = len(rows)
     name = html.escape(u["name"])
+    warn_txt = ("\n\n⚠️ <b>E'tibor bering</b>\n" + "\n".join(warnings)) if warnings else ""
     if n == 0:
         return (f"☀️ Xayrli tong, {name}! Men Posik 💜\n\n"
                 f"Kecha ({day_start.strftime('%d.%m')}) birorta ham stol yopilmabdi.\n"
-                "Bugun omad sizga yor bo'lsin! 🍀")
+                f"Bugun omad sizga yor bo'lsin! 🍀{warn_txt}")
     total = sum(r.get("total") or 0 for r in rows)
     tcost = sum(r.get("table_cost") or 0 for r in rows)
     bar = sum(r.get("extras_cost") or 0 for r in rows)
@@ -873,6 +994,31 @@ def build_daily_report(u: dict, rows: list[dict], prev_count: int, day_start: da
         mood = "Oldingi kundan biroz kamroq. Bugun to'ldiramiz! 💪"
     else:
         mood = "Yaxshi ishladingiz! 👏"
+
+    extra = []
+    ph = peak_hour(rows)
+    if ph:
+        extra.append(f"🔥 Eng qizg'in vaqt: {ph}")
+    tb = top_bar_item(rows)
+    if tb:
+        extra.append(f"🥤 Eng ko'p sotilgan: {html.escape(str(tb[0]))} ×{tb[1]}")
+    ts = top_staff(rows)
+    if ts:
+        extra.append(f"👏 Eng faol xodim: {html.escape(ts[0])} — {ts[1]} ta stol yopdi")
+    longest = max(rows, key=lambda r: r.get("duration_seconds") or 0)
+    if (longest.get("duration_seconds") or 0) >= 3600:
+        extra.append(f"⏱ Eng uzun o'yin: {fmt_dur(longest.get('duration_seconds'))} ({html.escape(str(longest.get('table_name') or '?'))})")
+
+    record = ""
+    if month_rows:
+        by_day = {}
+        for r in month_rows:
+            k = biz_day_of(r)
+            by_day[k] = by_day.get(k, 0) + (r.get("total") or 0)
+        yk = (day_start + timedelta(hours=1)).strftime("%Y-%m-%d")
+        if len(by_day) >= 3 and yk in by_day and by_day[yk] >= max(by_day.values()):
+            record = "\n🥇 <b>Bu oyning eng yaxshi kuni bo'ldi!</b>"
+
     return (
         f"☀️ Xayrli tong, {name}! Men Posik 💜\n"
         f"Kechagi kun hisoboti ({day_start.strftime('%d.%m')}, 08:00 – 08:00):\n\n"
@@ -882,9 +1028,53 @@ def build_daily_report(u: dict, rows: list[dict], prev_count: int, day_start: da
         f"   🥤 Bar: {fmt_money(bar)}\n"
         f"   {pay_line}\n"
         f"🏆 Eng faol stol: <b>{html.escape(str(top_t))}</b> ({tables[top_t]} marta)\n"
-        f"⏳ O'rtacha o'yin: {avg_min:.0f} daqiqa\n\n"
-        f"{mood}"
+        f"⏳ O'rtacha o'yin: {avg_min:.0f} daqiqa\n"
+        + ("\n" + "\n".join(extra) + "\n" if extra else "")
+        + f"{record}\n{mood}{warn_txt}"
     )
+
+
+def build_weekly_report(u: dict, rows: list[dict], prev_rows: list[dict], week_start: datetime) -> str:
+    name = html.escape(u["name"])
+    n, pn = len(rows), len(prev_rows)
+    total = sum(r.get("total") or 0 for r in rows)
+    ptotal = sum(r.get("total") or 0 for r in prev_rows)
+    period = f"{week_start.strftime('%d.%m')} – {(week_start + timedelta(days=6)).strftime('%d.%m')}"
+    if n == 0:
+        return f"📅 {name}, o'tgan hafta ({period}) stol yopilmabdi. Yangi hafta yangi imkoniyat! 🍀\n— Posik 💜"
+    if ptotal:
+        pct = (total - ptotal) / ptotal * 100
+        cmp = f"{'📈' if pct >= 0 else '📉'} O'tgan haftaga nisbatan: {'+' if pct >= 0 else ''}{pct:.0f}%"
+    else:
+        cmp = "📈 Bu birinchi to'liq haftangiz — davom etamiz!"
+    by_day = {}
+    for r in rows:
+        k = biz_day_of(r)
+        by_day[k] = by_day.get(k, 0) + (r.get("total") or 0)
+    best_k = max(by_day, key=by_day.get)
+    best_d = datetime.strptime(best_k, "%Y-%m-%d")
+    tables = {}
+    for r in rows:
+        k = r.get("table_name") or "?"
+        tables[k] = tables.get(k, 0) + 1
+    top_t = max(tables, key=tables.get)
+    lines = [
+        f"📅 <b>Haftalik xulosa</b> — {name}",
+        f"({period})\n",
+        f"🎱 Yopilgan stollar: <b>{n}</b>" + (f" (oldingi hafta {pn})" if pn else ""),
+        f"💰 Jami tushum: <b>{fmt_money(total)}</b>",
+        cmp,
+        f"🌟 Haftaning eng yaxshi kuni: {WEEKDAYS[best_d.weekday()]} ({best_d.strftime('%d.%m')}) — {fmt_money(by_day[best_k])}",
+        f"🏆 Eng faol stol: {html.escape(str(top_t))} ({tables[top_t]} marta)",
+    ]
+    tb = top_bar_item(rows)
+    if tb:
+        lines.append(f"🥤 Haftaning top mahsuloti: {html.escape(str(tb[0]))} ×{tb[1]}")
+    ts = top_staff(rows)
+    if ts:
+        lines.append(f"👏 Haftaning eng faol xodimi: {html.escape(ts[0])} ({ts[1]} ta stol)")
+    lines.append("\nYangi haftada ham omad! — Posik 💜")
+    return "\n".join(lines)
 
 
 async def send_daily_reports():
@@ -895,23 +1085,61 @@ async def send_daily_reports():
         return
     y_start, y_end = business_day_bounds(now_local, 1)
     p_start, p_end = business_day_bounds(now_local, 2)
+    m_start = y_start.replace(day=1)
     ids = [u["id"] for u in owners]
     rows = sessions_between(ids, y_start, y_end)
     prev = sessions_between(ids, p_start, p_end)
+    month = sessions_between(ids, m_start, y_end)
     for u in owners:
         if not claim_notification(u["id"], "daily_report", today):
             continue
         mine = [r for r in rows if r["owner_id"] == u["id"]]
         prev_n = len([r for r in prev if r["owner_id"] == u["id"]])
+        mine_month = [r for r in month if r["owner_id"] == u["id"]]
         try:
-            await bot.send_message(u["telegram_chat_id"], build_daily_report(u, mine, prev_n, y_start), parse_mode="HTML")
+            text = build_daily_report(u, mine, prev_n, y_start, mine_month, owner_warnings(u["id"]))
+            await bot.send_message(u["telegram_chat_id"], text, parse_mode="HTML")
         except Exception as e:
             log.warning("Hisobot yuborilmadi %s: %s", u.get("login"), e)
         await asyncio.sleep(0.1)
 
 
+async def send_weekly_reports():
+    now_local = datetime.now(TZ)
+    if now_local.weekday() != 0:      # faqat dushanba
+        return
+    today = now_local.strftime("%Y-%m-%d")
+    owners = pro_report_owners()
+    if not owners:
+        return
+    end, _ = business_day_bounds(now_local, 0)          # bugun 08:00
+    start = end - timedelta(days=7)
+    pstart = start - timedelta(days=7)
+    ids = [u["id"] for u in owners]
+    rows = sessions_between(ids, start, end)
+    prev = sessions_between(ids, pstart, start)
+    for u in owners:
+        if not claim_notification(u["id"], "weekly_report", today):
+            continue
+        try:
+            text = build_weekly_report(u, [r for r in rows if r["owner_id"] == u["id"]],
+                                       [r for r in prev if r["owner_id"] == u["id"]], start)
+            await bot.send_message(u["telegram_chat_id"], text, parse_mode="HTML")
+        except Exception as e:
+            log.warning("Haftalik hisobot yuborilmadi %s: %s", u.get("login"), e)
+        await asyncio.sleep(0.1)
+
+
+async def send_admin_daily():
+    today = datetime.now(TZ).strftime("%Y-%m-%d")
+    if claim_notification("admin", "admin_daily", today):
+        try:
+            await send_long(ADMIN_CHAT_ID, "☀️ Xayrli tong! Kechagi kun bo'yicha hisobot 👇\n\n" + build_admin_report(True))
+        except Exception as e:
+            log.warning("Admin hisoboti yuborilmadi: %s", e)
+
+
 CONGRATS = {
-    25: "🎉 Voy-bo'! Bugun allaqachon <b>25 ta</b> stol yopildi! Ish qizib ketdi 🔥",
     50: "🎊 Tabriklayman! Bugun <b>50 ta</b> stol yopildi! Zo'r kun bo'lyapti! 💪",
     100: "🏆 VOY! Bugun <b>100 ta</b> stol!!! Siz haqiqiy chempionsiz! 🎉🎉🎉",
     150: "🚀 <b>150 ta</b> stol! Bunaqasini hali ko'rmagandim! Rekord kun! 🤩",
@@ -921,7 +1149,8 @@ CONGRATS = {
 
 async def check_milestones():
     now_local = datetime.now(TZ)
-    owners = pro_report_owners()
+    # Posik o'chirilgan bo'lsa, tabrik yuborilmaydi
+    owners = [u for u in pro_report_owners() if u.get("posik_enabled", True) is not False]
     if not owners:
         return
     d_start, d_end = business_day_bounds(now_local, 0)
@@ -984,7 +1213,9 @@ async def scheduler():
         try:
             now_local = datetime.now(TZ)
             if now_local.hour == REPORT_HOUR:
+                await send_admin_daily()
                 await send_daily_reports()
+                await send_weekly_reports()
             if now_local.hour == REMINDER_HOUR:
                 await send_expiry_reminders()
             if asyncio.get_event_loop().time() - last_milestone > 300:
