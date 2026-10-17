@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -114,8 +115,11 @@ async def get_plan(plan_id: str) -> dict | None:
 
 
 def linked_user(chat_id: int) -> dict | None:
-    res = supabase.table("users").select("*").eq("telegram_chat_id", chat_id).order("created_at", desc=True).limit(1).execute()
-    return res.data[0] if res.data else None
+    """Shu chatga ulangan akkaunt. Faqat klub egasi (owner) qaytadi — xodim akkaunti hech qachon."""
+    res = supabase.table("users").select("*").eq("telegram_chat_id", chat_id).order("created_at", desc=True).execute()
+    rows = [u for u in (res.data or []) if (u.get("role") or "owner") == "owner"]
+    rows.sort(key=lambda u: 0 if u.get("telegram_verified") else 1)
+    return rows[0] if rows else None
 
 
 class Flow(StatesGroup):
@@ -123,6 +127,7 @@ class Flow(StatesGroup):
     awaiting_plan = State()
     awaiting_receipt = State()
     support = State()
+    awaiting_reset_login = State()
 
 
 # ---------------- Klaviaturalar ----------------
@@ -131,6 +136,7 @@ def main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💳 Obunani to'lash / uzaytirish", callback_data="pay")],
         [InlineKeyboardButton(text="💬 Posikka yozish (savol, taklif)", callback_data="support")],
         [InlineKeyboardButton(text="📊 Kunlik hisobot (Pro)", callback_data="report_info")],
+        [InlineKeyboardButton(text="🔑 Parolni unutdim", callback_data="forgot")],
         [InlineKeyboardButton(text="🌐 Ilovani ochish", url=SITE_URL)],
     ])
 
@@ -210,6 +216,9 @@ async def start(message: Message, state: FSMContext):
     if arg.startswith("link_"):
         await link_account(message, arg[5:])
         return
+    if arg == "forgot":
+        await begin_forgot(message, state)
+        return
     if arg in ("renew", "pay"):
         await begin_payment(message, state)
         return
@@ -263,6 +272,13 @@ async def link_account(message: Message, token: str):
     exp = parse_dt(u.get("tg_link_expires")) if u else None
     if not u or (exp and exp < datetime.now(timezone.utc)):
         await message.answer("Bu havola eskirgan yoki ishlatilgan 🙈 Ilovadan yangisini oling.")
+        return
+    if (u.get("role") or "owner") != "owner":
+        supabase.table("users").update({"tg_link_token": None, "tg_link_expires": None}).eq("id", u["id"]).execute()
+        await message.answer(
+            "Hisobotlar faqat klub egasiga yuboriladi 🔒\n\n"
+            "Savol yoki muammo bo'lsa — menga yozing, adminga yetkazaman 💜",
+            reply_markup=main_menu())
         return
     supabase.table("users").update({
         "telegram_chat_id": message.chat.id,
@@ -375,6 +391,17 @@ async def got_login(message: Message, state: FSMContext):
         await message.answer("Hmm, bunday login topilmadi 🤔 Qaytadan yozib ko'ring yoki avval saytda ro'yxatdan o'ting.")
         return
     user = res.data[0]
+    if (user.get("role") or "owner") == "staff":
+        # Obuna klub egasining akkauntiga yoziladi; xodim chatini egasining akkauntiga bog'lamaymiz.
+        o = supabase.table("users").select("*").eq("id", user.get("parent_owner_id")).limit(1).execute().data if user.get("parent_owner_id") else None
+        if not o:
+            await message.answer("Bu xodim akkaunti 🙂 Obunani klub egasining logini bilan to'lash kerak.")
+            return
+        owner = o[0]
+        await state.update_data(login=owner["login"], user_id=owner["id"], user_name=owner["name"])
+        await message.answer(f"Bu xodim akkaunti — obuna klub egasi <b>{html.escape(owner['name'])}</b> akkauntiga qo'shiladi 👌", parse_mode="HTML")
+        await after_user_known(message, state)
+        return
     await state.update_data(login=user["login"], user_id=user["id"], user_name=user["name"])
     # Chat'ni eslab qolamiz (to'lov xabarlari va obuna eslatmalari uchun).
     # Hisobot faqat ilovadagi xavfsiz havola orqali ulanganlarga boradi (telegram_verified).
@@ -697,6 +724,126 @@ async def support_message(message: Message, state: FSMContext):
 
 
 # ---------------- Admin: foydalanuvchilar ----------------
+# ---------------- Parolni tiklash ----------------
+def make_temp_password() -> str:
+    # o'qish oson: chalkash belgilar (0/O, 1/l/I) yo'q
+    abc = "abcdefghjkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(abc) for _ in range(8))
+
+
+def reset_password(login: str) -> tuple[dict | None, str | None]:
+    pw = make_temp_password()
+    res = supabase.rpc("admin_reset_user_password", {"p_login": login, "p_new_password": pw}).execute()
+    rows = res.data or []
+    return (rows[0] if rows else None), (pw if rows else None)
+
+
+async def begin_forgot(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(Flow.awaiting_reset_login)
+    await message.answer(
+        "Hech gap yo'q, tiklab beramiz! 🔑\n\nIlovadagi <b>login</b>ingizni yozing — men adminga yetkazaman. "
+        "Admin akkaunt sizniki ekanini tekshirgach, yangi parolni shu yerga yuboraman.",
+        parse_mode="HTML", reply_markup=cancel_keyboard())
+
+
+@dp.callback_query(F.data == "forgot")
+async def forgot_cb(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await begin_forgot(callback.message, state)
+
+
+@dp.message(Flow.awaiting_reset_login)
+async def forgot_login(message: Message, state: FSMContext):
+    login = (message.text or "").strip()
+    if not login or len(login) > 64:
+        await message.answer("Loginni matn ko'rinishida yozing 🙂")
+        return
+    safe = login.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    res = supabase.table("users").select("*").ilike("login", safe).limit(1).execute()
+    if not res.data:
+        await message.answer("Hmm, bunday login topilmadi 🤔 Qaytadan yozib ko'ring yoki /cancel")
+        return
+    u = res.data[0]
+    await state.clear()
+    tg = message.from_user
+    same_tg = u.get("telegram_chat_id") == message.chat.id
+    owner_line = ""
+    if (u.get("role") or "owner") == "staff" and u.get("parent_owner_id"):
+        o = supabase.table("users").select("name, login").eq("id", u["parent_owner_id"]).limit(1).execute().data
+        if o:
+            owner_line = f"\n👔 Xodim, egasi: {html.escape(o[0]['name'])} (<code>{html.escape(o[0]['login'])}</code>)"
+    text = (
+        "🔑 <b>Parolni tiklash so'rovi</b>\n\n"
+        f"Akkaunt: {html.escape(u['name'])} (<code>{html.escape(u['login'])}</code>){owner_line}\n"
+        f"📞 Akkaunt telefoni: {html.escape(str(u.get('phone') or '—'))}\n\n"
+        f"So'ragan: {html.escape(tg.full_name or '—')} " + (f"@{tg.username}" if tg.username else f'<a href="tg://user?id={tg.id}">profil</a>') + "\n"
+        + ("✅ Bu Telegram shu akkauntga ulangan" if same_tg else "⚠️ Bu Telegram akkauntga ulanmagan — egasi ekanini telefon orqali tekshiring!")
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Tiklash va yuborish", callback_data=f"pwreset:{u['id']}:{message.chat.id}"),
+        InlineKeyboardButton(text="❌ Rad etish", callback_data=f"pwdeny:{message.chat.id}"),
+    ]])
+    await bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML", reply_markup=kb)
+    await message.answer("So'rovingizni adminga yubordim 📨 Tasdiqlashi bilan yangi parolni shu yerga yuboraman!")
+
+
+@dp.callback_query(F.data.startswith("pwreset:"))
+async def pw_reset_cb(callback: CallbackQuery):
+    if callback.message.chat.id != ADMIN_CHAT_ID:
+        return
+    _, user_id, chat_id = callback.data.split(":")
+    u = supabase.table("users").select("login").eq("id", user_id).limit(1).execute().data
+    if not u:
+        await callback.answer("Akkaunt topilmadi", show_alert=True)
+        return
+    row, pw = reset_password(u[0]["login"])
+    if not pw:
+        await callback.answer("Tiklab bo'lmadi", show_alert=True)
+        return
+    try:
+        await bot.send_message(int(chat_id),
+            f"Tayyor! 🔑 Yangi vaqtinchalik parolingiz:\n\n<code>{pw}</code>\n\n"
+            f"Login: <code>{html.escape(u[0]['login'])}</code>\n"
+            "Kirgandan keyin <b>Sozlamalar → Parolni almashtirish</b> orqali o'zingizga qulay parol qo'yib oling 💜",
+            parse_mode="HTML")
+        sent = "✅ mijozga yuborildi"
+    except Exception as e:
+        sent = f"❌ mijozga yuborilmadi ({e}). Parolni o'zingiz bering: {pw}"
+    await callback.answer("Parol tiklandi")
+    await callback.message.edit_text((callback.message.html_text or callback.message.text or "") + f"\n\n🔑 TIKLANDI — {sent}", parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("pwdeny:"))
+async def pw_deny_cb(callback: CallbackQuery):
+    if callback.message.chat.id != ADMIN_CHAT_ID:
+        return
+    chat_id = int(callback.data.split(":")[1])
+    try:
+        await bot.send_message(chat_id, "Kechirasiz, so'rovingiz tasdiqlanmadi 😕 Savol bo'lsa, menga yozing — admin bilan bog'layman.", reply_markup=renew_keyboard())
+    except Exception:
+        pass
+    await callback.answer("Rad etildi")
+    await callback.message.edit_text((callback.message.html_text or callback.message.text or "") + "\n\n❌ RAD ETILDI", parse_mode="HTML")
+
+
+@dp.message(Command("parol"))
+async def admin_reset_cmd(message: Message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Foydalanish: <code>/parol login</code> — yangi vaqtinchalik parol yaratadi.", parse_mode="HTML")
+        return
+    row, pw = reset_password(parts[1].strip())
+    if not pw:
+        await message.answer("❌ Bunday login topilmadi.")
+        return
+    await message.answer(
+        f"🔑 Parol tiklandi\n{html.escape(row.get('user_name') or '')} (<code>{html.escape(row.get('user_login') or '')}</code>)\n\n"
+        f"Yangi parol: <code>{pw}</code>\n\nMijozga bering — kirgach o'zi almashtirsin.", parse_mode="HTML")
+
+
 @dp.message(Command("users"))
 async def list_users(message: Message):
     if message.chat.id != ADMIN_CHAT_ID:
@@ -1278,6 +1425,7 @@ async def main():
             BotCommand(command="users", description="Foydalanuvchilar ro'yxati"),
             BotCommand(command="tariflar", description="Faol tariflar"),
             BotCommand(command="hisobot", description="Umumiy hisobot"),
+            BotCommand(command="parol", description="Parolni tiklash: /parol login"),
         ],
         scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID),
     )
